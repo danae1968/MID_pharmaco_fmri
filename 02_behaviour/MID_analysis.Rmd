@@ -1,0 +1,1549 @@
+---
+title: "MID Behavioural Analysis"
+author: "Danae Papadopetraki"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+rm(list = ls())
+```
+
+# Overview
+
+Behavioural analysis of the monetary incentive delay (MID) task in a
+within-subject, placebo-controlled study with three sessions:
+methylphenidate (MPH), sulpiride (SUL) and placebo (PBO). This document:
+
+1. Builds the per-subject summary matrix from the trial-level data
+   (`trialwiseMID.csv`) and excludes outlying sessions (|z(RT)| > 3).
+2. Runs 2 x 3 repeated-measures ANOVAs (Reward x Drug) on RT, hit,
+   too-late and too-early rates, with Holm-corrected pairwise drug
+   contrasts. (Miss = 1 - hit, so its ANOVA would duplicate the hit ANOVA.)
+3. Tests whether baseline dopamine synthesis capacity (ki, [18F]-FDOPA PET)
+   moderates the drug or reward effects (mixed ANCOVA).
+4. Fits ex-Gaussian RT distributions per subject and tests drug and reward
+   effects on mu, sigma and tau.
+5. Writes per-subject behavioural drug effects used as covariates in the
+   fMRI group models (`MID_beh_covariates.csv`).
+6. Builds the publication tables of the fMRI cluster results.
+
+**Response coding** (`resp` column): `1` = hit, `2` = too late, `-1` = too early,
+`0` = no response. `miss` = every non-hit trial (`resp != 1`), i.e. miss =
+early + late + no-response.
+
+# Configuration & packages
+
+```{r config}
+## --- Paths -----------------------------------------------------------------
+# Optional local copy of the data (same relative layout as the project
+# folder), set via the MID_LOCAL_DATA environment variable; otherwise the
+# project storage is used.
+localCandidates <- Sys.getenv("MID_LOCAL_DATA")
+localHit <- localCandidates[nzchar(localCandidates) & dir.exists(localCandidates)]
+
+if (length(localHit) > 0) {
+  projectDir <- localHit[1]
+} else if (Sys.info()["sysname"] == "Windows") {
+  projectDir <- "P:/3017048.01"
+} else {
+  projectDir <- "/project/3017048.01"
+}
+behDir <- file.path(projectDir, "bids", "derivatives", "beh", "MID", "stats")
+
+trial_file <- file.path(behDir, "trialwiseMID.csv")
+
+outDir <- file.path(behDir, "MID_output")
+dir.create(outDir, showWarnings = FALSE)
+
+## Save a ggplot/ggarrange figure as both .png and .pdf
+save_fig <- function(plot, name, width = 6, height = 4, dpi = 300) {
+  ggplot2::ggsave(file.path(outDir, paste0(name, ".png")), plot,
+                   width = width, height = height, dpi = dpi)
+  ggplot2::ggsave(file.path(outDir, paste0(name, ".pdf")), plot,
+                   width = width, height = height)
+}
+## --- Packages --------------------------------------------------------------
+packages <- c("dplyr", "tidyr", "readr", "ggplot2", "afex", "emmeans",
+              "rstatix", "ggpubr", "tibble", "ggrain", "sjPlot", "effectsize",
+              'kableExtra')
+
+to_install <- setdiff(packages, rownames(installed.packages()))
+if (length(to_install) > 0) install.packages(to_install)
+invisible(lapply(packages, library, character.only = TRUE))
+
+afex::afex_options(es_aov = "pes", correction_aov = "GG",
+                   emmeans_model = "multivariate")
+
+nTrialsTotal <- 56   # trials per session
+nTrialsCell  <- 28   # trials per reward per session
+
+## Drug colours (colour-blind safe)
+drug_cols <- c(PBO = "#F0E442", MPH = "#009E73", SUL = "#56B4E9")
+```
+
+# Load trial-wise data
+
+`trialwiseMID.csv` has no header. Columns: subject, session, trial, drug,
+5 ki values (striatal ROIs), resp, rt (target-locked), reward type, rtCue
+(cue-locked) and trial-timing columns.
+
+```{r load}
+raw <- readr::read_csv(trial_file, col_names = FALSE, show_col_types = FALSE)
+
+trial <- raw %>%
+  dplyr::transmute(
+    subject = X1,
+    session = X2,
+    trial   = X3,
+    drug    = factor(X4, levels = c(0, 1, 2),
+                     labels = c("PBO", "MPH", "SUL")),
+    resp    = X10,                       # 1 hit, 2 late, -1 early, 0 no-resp
+    rt      = X11,                       # target-locked RT (hits + lates only)
+    reward  = factor(X12, levels = c(1, 2),
+                     labels = c("Low", "High")),
+    rtCue   = X13                        # cue-locked response time
+  ) %>%
+  dplyr::filter(!is.na(reward))                 # drop trials with no reward code
+
+## ki values (one row per subject, constant within subject)
+ki <- raw %>%
+  dplyr::group_by(subject = X1) %>%
+  dplyr::summarise(strki = dplyr::first(X5), putki = dplyr::first(X6), caudki = dplyr::first(X7),
+            dcaudki = dplyr::first(X8), vstrki = dplyr::first(X9), .groups = "drop")
+```
+
+# Build the per-subject summary matrix
+
+Response rates and mean RT per subject x drug x reward cell, and per
+subject x drug.
+
+```{r summary-matrix}
+## Cell level: subject x drug x reward.
+## Denominator = actual trial count in the cell (n_cell), not a fixed 28.
+cell <- trial %>%
+  dplyr::group_by(subject, drug, reward) %>%
+  dplyr::summarise(
+    n_cell = n(),                                   # trials in this cell
+    hit    = sum(resp == 1,  na.rm = TRUE) / n_cell,
+    late   = sum(resp == 2,  na.rm = TRUE) / n_cell,
+    early  = sum(resp == -1, na.rm = TRUE) / n_cell,
+    nr     = sum(resp == 0,  na.rm = TRUE) / n_cell,
+    miss   = sum(resp != 1,  na.rm = TRUE) / n_cell,
+    ## RT averaged over hits + lates only
+    rt     = mean(rt[resp == 1 | resp == 2], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+## Report any cell short of the intended 28 trials
+short_cells <- cell %>% dplyr::filter(n_cell != nTrialsCell)
+if (nrow(short_cells) > 0) {
+  message(nrow(short_cells), " cell(s) do not have ", nTrialsCell,
+          " trials (rates still correct via per-cell denominator):")
+  print(short_cells %>% dplyr::select(subject, drug, reward, n_cell))
+}
+
+## Drug level: collapsed across reward.
+## Denominator = actual trial count in the session (n_sess), not a fixed 56.
+drug_lvl <- trial %>%
+  dplyr::group_by(subject, drug) %>%
+  dplyr::summarise(
+    n_sess = n(),
+    hit    = sum(resp == 1,  na.rm = TRUE) / n_sess,
+    late   = sum(resp == 2,  na.rm = TRUE) / n_sess,
+    early  = sum(resp == -1, na.rm = TRUE) / n_sess,
+    nr     = sum(resp == 0,  na.rm = TRUE) / n_sess,
+    miss   = sum(resp != 1,  na.rm = TRUE) / n_sess,
+    rt     = mean(rt[resp == 1 | resp == 2], na.rm = TRUE),
+    .groups = "drop"
+  )
+
+## Long format used by every ANOVA below
+beh_long_all <- cell %>%
+  dplyr::mutate(subject = factor(subject))
+
+## Wide summary matrix, one row per subject
+beh_wide_all <- cell %>%
+  dplyr::select(-n_cell) %>%
+  tidyr::pivot_wider(
+    names_from  = c(reward, drug),
+    values_from = c(rt, hit, late, early, miss, nr),
+    names_glue  = "{.value}{reward}{drug}"
+  ) %>%
+  dplyr::left_join(
+    drug_lvl %>%
+      dplyr::select(-n_sess) %>%
+      tidyr::pivot_wider(names_from = drug,
+                  values_from = c(rt, hit, late, early, miss, nr),
+                  names_glue = "{.value}{drug}"),
+    by = "subject"
+  ) %>%
+  dplyr::left_join(ki, by = "subject")
+
+readr::write_csv(beh_wide_all, file.path(outDir, "MID_summary_matrix.csv"))
+head(beh_long_all)
+```
+# Session-level outlier exclusion (RT)
+
+Mean RT is computed per subject x session. Sessions without any hit or
+late response are missing data, not outliers, and are left out of the
+z-scoring. RTs of the remaining sessions are z-scored against the grand
+mean and SD across all sessions, and a session is excluded if
+|z(RT)| > 3. The excluded sessions are removed from every analysis below
+(and from the fMRI group models).
+
+```{r outlier-exclusion-session}
+criterion <- 3  # SD threshold
+
+## ---- 1. Per-session RT (hits + lates) -------------------------------------
+session_means <- trial %>%
+  dplyr::group_by(subject, session) %>%
+  dplyr::summarise(
+    n_trials = n(),
+    rt_sess  = mean(rt[resp %in% c(1, 2)], na.rm = TRUE),
+    acc_sess = sum(resp == 1, na.rm = TRUE) / nTrialsTotal,
+    .groups  = "drop"
+  ) %>%
+  dplyr::mutate(incomplete = is.nan(rt_sess))  # no hit/late trials at all -> no RT to average
+
+## ---- 2. Grand-mean z on RT, complete sessions only -----------------------
+complete <- session_means %>% dplyr::filter(!incomplete)
+
+mu_rt <- mean(complete$rt_sess, na.rm = T)
+sd_rt <- sd(complete$rt_sess, na.rm = T)
+
+session_means <- session_means %>%
+  dplyr::mutate(
+    z_rt    = (rt_sess - mu_rt) / sd_rt,
+    outlier = !incomplete & !is.na(z_rt) & abs(z_rt) > criterion
+  )
+
+## ---- 3. Report -----------------------------------------------------------
+flagged <- session_means %>% dplyr::filter(outlier)
+
+cat(sprintf("Grand RT mean = %.3f s, SD = %.3f\n", mu_rt, sd_rt))
+cat(sprintf("Complete sessions: %d / %d (incomplete: %d)\n\n",
+            nrow(complete), nrow(session_means),
+            sum(session_means$incomplete)))
+cat(sprintf("Flagged sessions (|z(RT)| > %d): %d, in %d subjects\n\n",
+            criterion, nrow(flagged), dplyr::n_distinct(flagged$subject)))
+
+print(flagged %>% dplyr::select(subject, session, rt_sess, z_rt, acc_sess),
+      n = Inf)
+
+readr::write_csv(session_means,
+                 file.path(outDir, "MID_session_outlier_flags.csv"))
+
+## ---- 4. Map (subject, session) -> drug; drop from beh_long ---------------
+if (!exists("drugcodes")) {
+  drugcodes_file <- file.path(projectDir, "admin", "9.Deblinding",
+                              "drugcodes_sessByDrug.csv")
+  drugcodes <- readr::read_csv(drugcodes_file, show_col_types = FALSE)
+}
+
+drug_long <- drugcodes %>%
+  tidyr::pivot_longer(c(MPHsession, SULsession, PBOsession),
+                      names_to = "drug", values_to = "session") %>%
+  dplyr::mutate(drug = sub("session$", "", drug))
+
+flagged_drug <- flagged %>%
+  dplyr::select(subject, session) %>%
+  dplyr::left_join(drug_long, by = c("subject", "session"))
+
+cat("\nFlagged sessions mapped to drug:\n")
+print(flagged_drug, n = Inf)
+
+## (subject, drug) cells to remove: the RT-outlier sessions. Incomplete
+## sessions are not added here; they were only left out of the z-scoring.
+to_remove <- flagged_drug
+
+cat(sprintf("\nTotal cells to remove from beh_long: %d (%d outlier)\n",
+            nrow(to_remove), nrow(flagged_drug)))
+
+## Remove the to_remove (subject, drug) cells from any data frame with
+## subject + drug columns, so every analysis below (ANOVAs, ex-Gaussian
+## fits, response-time profiles) uses the same exclusions.
+drop_flagged_cells <- function(df) {
+  df %>%
+    dplyr::mutate(subject_chr = as.character(subject)) %>%
+    dplyr::anti_join(
+      to_remove %>% dplyr::mutate(subject_chr = as.character(subject)) %>%
+        dplyr::select(subject_chr, drug),
+      by = c("subject_chr", "drug")
+    ) %>%
+    dplyr::select(-subject_chr)
+}
+
+beh_long <- beh_long_all %>% drop_flagged_cells() %>% droplevels()
+
+cat(sprintf("\nbeh_long after exclusion: %d unique subjects, %d rows\n",
+            dplyr::n_distinct(beh_long$subject), nrow(beh_long)))
+
+## Same exclusion on the trial-level data (ex-Gaussian fits, RT profiles)
+trial_excl <- trial %>% drop_flagged_cells() %>% droplevels()
+
+cat(sprintf("trial_excl after exclusion: %d unique subjects, %d rows (from %d)\n",
+            dplyr::n_distinct(trial_excl$subject), nrow(trial_excl), nrow(trial)))
+```
+
+# ANOVA helper
+
+`afex::aov_ez` runs the 2 x 3 repeated-measures ANOVA, applies
+Greenhouse-Geisser correction when sphericity is violated, and reports partial
+eta-squared. Subjects with any missing cell are dropped listwise (required for a
+within-subjects ANOVA).
+
+```{r anova-fn}
+run_rm_anova <- function(data, dv, dv_label = dv) {
+  d <- data %>%
+    dplyr::select(subject, drug, reward, all_of(dv)) %>%
+    tidyr::drop_na()
+  keep <- d %>% dplyr::count(subject) %>% dplyr::filter(n == 6) %>% dplyr::pull(subject)
+  d <- d %>% dplyr::filter(subject %in% keep) %>% droplevels()
+
+  aov_res <- afex::aov_ez(id = "subject", dv = dv, data = d,
+                          within = c("drug", "reward"))
+  cat("\n### ANOVA:", dv_label, "  (N =", nlevels(d$subject), ")\n")
+  print(aov_res)
+
+  ## pairwise drug contrasts (Holm-corrected)
+  emm <- emmeans::emmeans(aov_res, ~ drug)
+  cat("\nPairwise drug contrasts:\n")
+  print(pairs(emm, adjust = "holm"))
+
+  invisible(list(anova = aov_res, emm = emm, data = d))
+}
+```
+
+# Reaction time
+
+```{r fig-rt, fig.width=6, fig.height=4}
+rt_summ <- rstatix::get_summary_stats(
+  beh_long %>% dplyr::group_by(drug, reward), rt, type = "mean_se")
+
+p_rt <- ggplot(rt_summ, aes(reward, mean, colour = drug, group = drug)) +
+  geom_line(linewidth = 1) + geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = .08) +
+  scale_colour_manual(values = drug_cols) +
+  labs(x = "Reward", y = "Reaction time (s)", colour = "Drug") +
+  theme_classic(base_size = 14)
+
+save_fig(p_rt, "fig_rt", width = 6, height = 4)
+p_rt
+```
+
+```{r anova-rt, results='asis'}
+res_rt <- run_rm_anova(beh_long, "rt", "Reaction time")
+```
+
+# Hit rate
+
+```{r fig-hit, fig.width=6, fig.height=4}
+hit_summ <- rstatix::get_summary_stats(
+  beh_long %>% dplyr::group_by(drug, reward), hit, type = "mean_se")
+
+p_hit <- ggplot(hit_summ, aes(reward, mean, colour = drug, group = drug)) +
+  geom_line(linewidth = 1) + geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = .08) +
+  scale_colour_manual(values = drug_cols) +
+  labs(x = "Reward", y = "Hit rate", colour = "Drug") +
+  theme_classic(base_size = 14)
+
+save_fig(p_hit, "fig_hit", width = 6, height = 4)
+p_hit
+```
+
+```{r anova-hit, results='asis'}
+res_hit <- run_rm_anova(beh_long, "hit", "Hit rate")
+```
+
+# Too-late rate
+
+```{r fig-late, fig.width=6, fig.height=4}
+late_summ <- rstatix::get_summary_stats(
+  beh_long %>% dplyr::group_by(drug, reward), late, type = "mean_se")
+
+p_late <- ggplot(late_summ, aes(reward, mean, colour = drug, group = drug)) +
+  geom_line(linewidth = 1) + geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = .08) +
+  scale_colour_manual(values = drug_cols) +
+  labs(x = "Reward", y = "Too-late rate", colour = "Drug") +
+  theme_classic(base_size = 14)
+
+save_fig(p_late, "fig_late", width = 6, height = 4)
+p_late
+```
+
+```{r anova-late, results='asis'}
+res_late <- run_rm_anova(beh_long, "late", "Too-late rate")
+```
+
+# Too-early rate
+
+```{r fig-early, fig.width=6, fig.height=4}
+early_summ <- rstatix::get_summary_stats(
+  beh_long %>% dplyr::group_by(drug, reward), early, type = "mean_se")
+
+p_early <- ggplot(early_summ, aes(reward, mean, colour = drug, group = drug)) +
+  geom_line(linewidth = 1) + geom_point(size = 2.5) +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = .08) +
+  scale_colour_manual(values = drug_cols) +
+  labs(x = "Reward", y = "Too-early rate", colour = "Drug") +
+  theme_classic(base_size = 14)
+
+save_fig(p_early, "fig_early", width = 6, height = 4)
+p_early
+```
+
+```{r anova-early, results='asis'}
+res_early <- run_rm_anova(beh_long, "early", "Too-early rate")
+```
+
+# Combined results table
+
+```{r results-table}
+tidy_anova <- function(res, dv_label) {
+  res$anova$anova_table %>%
+    as.data.frame() %>%
+    tibble::rownames_to_column("Effect") %>%
+    dplyr::mutate(DV = dv_label, .before = 1)
+}
+
+all_results <- dplyr::bind_rows(
+  tidy_anova(res_rt,    "Reaction time"),
+  tidy_anova(res_hit,   "Hit rate"),
+  tidy_anova(res_late,  "Too-late rate"),
+  tidy_anova(res_early, "Too-early rate")
+)
+print(all_results, digits = 3)
+readr::write_csv(all_results, file.path(outDir, "MID_ANOVA_results.csv"))
+```
+
+# Publication table
+
+A formatted ANOVA table for the manuscript: F, degrees of freedom
+(Greenhouse-Geisser corrected where sphericity was violated), p-value, and
+partial eta-squared as the effect size. `sjPlot::tab_df` renders an HTML table
+that can be copied straight into a manuscript or saved to file.
+
+```{r pub-table}
+## ---- ANOVA rows: one row per effect, F(df1,df2) + p + partial eta^2 -------
+## afex anova_table columns: "num Df", "den Df", "MSE", "F", "pes", "Pr(>F)".
+anova_rows <- function(res) {
+  at <- as.data.frame(res$anova$anova_table)
+  data.frame(
+    Effect = c("Drug", "Reward", "Drug x Reward"),
+    Statistic = sprintf("%.2f (%.0f, %.0f)",
+                        at[["F"]], at[["num Df"]], at[["den Df"]]),
+    p = ifelse(at[["Pr(>F)"]] < .001, "< .001",
+               sprintf("%.3f", at[["Pr(>F)"]])),
+    ES = sprintf("%.3f", at[["pes"]]),
+    check.names = FALSE, row.names = NULL
+  )
+}
+
+## ---- Pairwise drug contrast rows: one row per contrast --------------------
+## emmeans pairs() gives estimate, SE, df, t.ratio, p.value (Holm-adjusted).
+## Effect size = Cohen's d for paired data, d = t / sqrt(n), with n = df + 1.
+contrast_rows <- function(res) {
+  ct <- as.data.frame(pairs(res$emm, adjust = "holm"))
+  d  <- ct$t.ratio / sqrt(ct$df + 1)
+  data.frame(
+    Effect = as.character(ct$contrast),
+    Statistic = sprintf("t(%.0f) = %.2f", ct$df, ct$t.ratio),
+    p = ifelse(ct$p.value < .001, "< .001", sprintf("%.3f", ct$p.value)),
+    ES = sprintf("%.2f", d),
+    check.names = FALSE, row.names = NULL
+  )
+}
+
+dvs <- list("Reaction time" = res_rt,  "Hit rate"       = res_hit,
+            "Too-late rate" = res_late, "Too-early rate" = res_early)
+
+## ---- Stack ANOVA section then contrast section ----------------------------
+## Strip row names so rbind does not append .1/.2/.3 suffixes.
+anova_block    <- do.call(rbind, lapply(dvs, anova_rows))
+contrast_block <- do.call(rbind, lapply(dvs, contrast_rows))
+rownames(anova_block)    <- NULL
+rownames(contrast_block) <- NULL
+tbl <- rbind(anova_block, contrast_block)
+rownames(tbl) <- NULL
+
+## row counts per DV (3 effects each in ANOVA; 3 pairs each in contrasts)
+n_aov <- vapply(dvs, function(r) nrow(anova_rows(r)),    integer(1))
+n_con <- vapply(dvs, function(r) nrow(contrast_rows(r)), integer(1))
+
+## ---- Build the kable ------------------------------------------------------
+## Generic column headers (Statistic / Effect size) because the two sections
+## report different quantities - explained in the footnote.
+table_beh <- tbl %>%
+  kable("html", escape = FALSE, row.names = FALSE,
+        caption = 'Table 1. Repeated-measures ANOVA of MID behaviour (Drug x Reward) and pairwise drug contrasts',
+        col.names = c(" ", "Statistic", "<i>P</i>", "Effect size")) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria",
+                font_size = 16, position = 'center') %>%
+  pack_rows("Omnibus ANOVA", 1, nrow(anova_block)) %>%
+  pack_rows("Pairwise drug contrasts (Holm-corrected)",
+            nrow(anova_block) + 1, nrow(tbl))
+
+## per-DV italic sub-headers within each section
+start <- 0
+for (i in seq_along(dvs)) {
+  table_beh <- table_beh %>%
+    pack_rows(names(dvs)[i], start + 1, start + n_aov[i],
+              label_row_css = "font-style: italic;")
+  start <- start + n_aov[i]
+}
+for (i in seq_along(dvs)) {
+  table_beh <- table_beh %>%
+    pack_rows(names(dvs)[i], start + 1, start + n_con[i],
+              label_row_css = "font-style: italic;")
+  start <- start + n_con[i]
+}
+
+table_beh <- table_beh %>%
+  footnote(general = paste(
+    "Omnibus ANOVA rows: Statistic is F (df1, df2), Effect size is partial eta-squared;",
+    "Greenhouse-Geisser correction applied where sphericity was violated.",
+    "Contrast rows: Statistic is t (df), Effect size is Cohen's d for paired data (d = t / sqrt(n));",
+    "paired t-tests with Holm correction for multiple comparisons."),
+    general_title = "Note. ", footnote_as_chunk = TRUE)
+
+table_beh
+
+## ---- Save -----------------------------------------------------------------
+readr::write_csv(tbl, file.path(outDir, "MID_behaviour_table.csv"))
+
+if (!requireNamespace("webshot2", quietly = TRUE)) install.packages("webshot2")
+kableExtra::save_kable(table_beh,
+                       file = file.path(outDir, "MID_behaviour_table.png"), zoom = 2)
+kableExtra::save_kable(table_beh,
+                       file = file.path(outDir, "MID_behaviour_table.pdf"))
+```
+# Baseline dopamine synthesis capacity (ki) as a moderator
+```{r ki-covariate-anova}
+## ----------------------------------------------------------------------------
+## Does the Drug or Reward effect depend on baseline dopamine synthesis (ki)?
+##
+## ki is constant within subject => a BETWEEN-subjects covariate.
+## Model: mixed ANCOVA with within factors Drug, Reward and continuous
+## covariate ki. The terms of interest are the ki interactions:
+##   Drug:ki, Reward:ki, Drug:Reward:ki
+## A non-significant interaction => the effect does not depend on baseline DA.
+## afex::aov_ez takes the covariate via `covariate=` with `factorize=FALSE`.
+## ki is mean-centred so the main effects remain interpretable.
+## ----------------------------------------------------------------------------
+
+## ki ROIs to test: whole striatum, caudate, putamen, ventral striatum
+ki_rois <- c(strki  = "Whole striatum",
+             caudki = "Caudate",
+             putki  = "Putamen",
+             vstrki = "Ventral striatum")
+
+## Behavioural DVs to test
+ki_dvs <- c(rt = "Reaction time", hit = "Hit rate",
+            late = "Too-late rate", early = "Too-early rate")
+
+## One mixed ANCOVA: dv ~ drug * reward * ki, for one DV and one ROI.
+run_ki_anova <- function(data, dv, roi_col) {
+
+d <- data %>%
+    dplyr::mutate(subject = as.character(subject)) %>%
+    dplyr::left_join(
+      ki %>% dplyr::mutate(subject = as.character(subject)) %>%
+             dplyr::select(subject, kicov = all_of(roi_col)),
+      by = "subject"
+    ) %>%
+    dplyr::select(subject, drug, reward, kicov, val = all_of(dv)) %>%
+    tidyr::drop_na()
+
+  ## keep only subjects with all 6 within-cells AND a ki value
+  keep <- d %>% dplyr::count(subject) %>%
+    dplyr::filter(n == 6) %>% dplyr::pull(subject)
+  d <- d %>% dplyr::filter(subject %in% keep) %>% droplevels()
+
+  ## mean-centre the covariate
+  d$kicov <- d$kicov - mean(d$kicov)
+
+  afex::aov_ez(id = "subject", dv = "val", data = d,
+               within = c("drug", "reward"),
+               covariate = "kicov", factorize = FALSE)
+}
+
+## Extract the three ki-interaction rows from an aov_ez object.
+ki_interaction_rows <- function(aov_res, dv_label, roi_label) {
+  at <- as.data.frame(aov_res$anova_table)
+  at$Term <- rownames(at)
+wanted <- c("kicov:drug", "kicov:reward", "kicov:drug:reward")
+  pretty <- c("kicov:drug"        = "Drug \u00D7 ki",
+              "kicov:reward"      = "Reward \u00D7 ki",
+              "kicov:drug:reward" = "Drug \u00D7 Reward \u00D7 ki")
+  out <- at[at$Term %in% wanted, , drop = FALSE]
+  data.frame(
+    DV        = dv_label,
+    ROI       = roi_label,
+    Effect    = pretty[out$Term],
+    Statistic = sprintf("%.2f (%.0f, %.0f)",
+                        out[["F"]], out[["num Df"]], out[["den Df"]]),
+    p         = ifelse(out[["Pr(>F)"]] < .001, "< .001",
+                       sprintf("%.3f", out[["Pr(>F)"]])),
+    ES        = sprintf("%.3f", out[["pes"]]),
+    row.names = NULL, check.names = FALSE
+  )
+}
+
+## Run across all DV x ROI combinations
+ki_results <- dplyr::bind_rows(
+  lapply(names(ki_dvs), function(dv) {
+    dplyr::bind_rows(
+      lapply(names(ki_rois), function(roi) {
+        aov_res <- run_ki_anova(beh_long, dv, roi)
+        ki_interaction_rows(aov_res, ki_dvs[[dv]], ki_rois[[roi]])
+      })
+    )
+  })
+)
+
+print(ki_results)
+readr::write_csv(ki_results, file.path(outDir, "MID_ki_covariate_stats.csv"))
+```
+
+```{r ki-supp-table}
+## Supplementary table: ki interactions, one section per ROI.
+ki_disp <- ki_results %>% dplyr::select(DV, Effect, Statistic, p, ES)
+
+n_per_roi <- ki_results %>% dplyr::count(ROI) %>%
+  dplyr::arrange(factor(ROI, levels = unname(ki_rois))) %>% dplyr::pull(n)
+
+ki_table <- ki_disp %>%
+  kableExtra::kable("html", escape = FALSE, row.names = FALSE,
+        caption = paste("Supplementary Table S2. Baseline dopamine synthesis",
+                         "capacity (ki) as a moderator of the Drug and Reward",
+                         "effects on MID behaviour"),
+        col.names = c("Measure", "Effect", "Statistic", "<i>P</i>",
+                      "Effect size")) %>%
+  kableExtra::kable_classic(full_width = FALSE, html_font = "Cambria",
+                font_size = 16, position = "center")
+
+start <- 0
+for (i in seq_along(ki_rois)) {
+  ki_table <- ki_table %>%
+    kableExtra::pack_rows(unname(ki_rois)[i], start + 1,
+                          start + n_per_roi[i],
+                          label_row_css = "font-style: italic;")
+  start <- start + n_per_roi[i]
+}
+
+ki_table <- ki_table %>%
+  kableExtra::footnote(general = paste(
+    "Mixed ANCOVA with within-subject factors Drug and Reward and",
+    "mean-centred ki as a between-subjects covariate; only the ki",
+    "interaction terms are shown. Statistic is F (df1, df2),",
+    "Effect size is partial eta-squared. Greenhouse-Geisser correction",
+    "applied where sphericity was violated."),
+    general_title = "Note. ", footnote_as_chunk = TRUE)
+
+ki_table
+kableExtra::save_kable(ki_table,
+  file = file.path(outDir, "MID_ki_covariate_table.png"), zoom = 2)
+kableExtra::save_kable(ki_table,
+  file = file.path(outDir, "MID_ki_covariate_table.pdf"))
+```
+
+# Raincloud plots
+
+Raincloud plots (`ggrain::geom_rain`) per behavioural measure, in two
+panels: the drug effect (collapsed across reward) and the reward effect
+(collapsed across drug), with lines connecting each subject's repeated
+measures.
+
+```{r raincloud-fn, fig.width=6, fig.height=4.5}
+## Shared theme
+rain_theme <- ggplot2::theme_classic() +
+  ggplot2::theme(
+    axis.title = ggplot2::element_text(size = 22),
+    axis.line  = ggplot2::element_line(colour = "black", linewidth = 1.2),
+    axis.ticks = ggplot2::element_line(colour = "black", linewidth = 1.2),
+    axis.text  = ggplot2::element_text(colour = "#4D4E4F", size = 16,
+                                       face = "bold"),
+    legend.position = "none"
+  )
+
+## Raincloud across DRUG (collapsed over reward)
+raincloud_drug <- function(data, dv, ylab) {
+  d <- data %>%
+    dplyr::group_by(subject, drug) %>%
+    dplyr::summarise(value = mean(.data[[dv]], na.rm = TRUE),
+                     .groups = "drop") %>%
+    tidyr::drop_na()
+
+  ggplot(d, aes(drug, value, fill = drug, colour = drug)) +
+    geom_rain(
+      id.long.var = "subject",
+      boxplot.args     = list(outlier.shape = NA, fill = NA, alpha = .9, linewidth = 1.2),
+      violin.args      = list(alpha = .8, colour = NA),
+      boxplot.args.pos = list(width = .2),
+      line.args        = list(colour = "grey", alpha = .5, linewidth = .6),
+      point.args       = list(size = 1.5, alpha = .3, shape = 21)
+    ) +
+    stat_summary(fun = mean, geom = "line", aes(group = 1),
+                 linewidth = .9, colour = "black") +
+    stat_summary(fun = mean, geom = "point", aes(group = 1),
+                 colour = "black", size = 2) +
+    scale_fill_manual(values = drug_cols) +
+    scale_colour_manual(values = drug_cols) +
+    labs(x = "Drug", y = ylab) +
+    rain_theme
+}
+
+## Raincloud across REWARD (collapsed over drug)
+raincloud_reward <- function(data, dv, ylab) {
+  d <- data %>%
+    dplyr::group_by(subject, reward) %>%
+    dplyr::summarise(value = mean(.data[[dv]], na.rm = TRUE),
+                     .groups = "drop") %>%
+    tidyr::drop_na()
+
+  ggplot(d, aes(reward, value)) +
+    geom_rain(
+      id.long.var = "subject",
+      boxplot.args     = list(outlier.shape = NA, fill = NA, alpha = .9, linewidth = 1.2),
+      violin.args      = list(alpha = .8, colour = "darkgrey",
+                              fill = "darkgrey"),
+      boxplot.args.pos = list(width = .2),
+      line.args        = list(colour = "grey", alpha = .5, linewidth = .6),
+      point.args       = list(size = 1.5, alpha = .3, shape = 21)
+    ) +
+    stat_summary(fun = mean, geom = "line", aes(group = 1),
+                 linewidth = .9, colour = "black") +
+    stat_summary(fun = mean, geom = "point", aes(group = 1),
+                 colour = "black", size = 2) +
+    labs(x = "Reward", y = ylab) +
+    rain_theme
+}
+```
+
+```{r raincloud-plots, fig.width=11, fig.height=4.5}
+rain_specs <- list(
+  c(dv = "rt",    ylab = "Reaction time (s)"),
+  c(dv = "hit",   ylab = "Hit rate"),
+  c(dv = "late",  ylab = "Too-late rate"),
+  c(dv = "early", ylab = "Impulsive responses")
+)
+
+for (sp in rain_specs) {
+  p_d <- raincloud_drug(beh_long,   sp["dv"], sp["ylab"])
+  p_r <- raincloud_reward(beh_long, sp["dv"], sp["ylab"])
+  combined <- ggpubr::ggarrange(p_d, p_r, labels = c("A", "B"), ncol = 2)
+  annotated <- ggpubr::annotate_figure(
+    combined,
+    top = ggpubr::text_grob(sp["ylab"], face = "bold", size = 16))
+  print(annotated)
+  save_fig(annotated, paste0("raincloud_", sp["dv"]), width = 11, height = 4.5)
+}
+```
+
+# Ex-Gaussian RT density curves
+
+An ex-Gaussian is fit **per subject** (method of moments) to the
+target-locked RTs (hits + lates), each subject's fitted PDF is evaluated on a
+common grid and scaled to frequency, and the **group mean +/- SE** is plotted.
+Averaging per-subject fits avoids the distortion of fitting one curve to
+RTs pooled across subjects.
+The ex-Gaussian is defined on positive RTs, so this curve covers hits and lates;
+too-early responses (negative target-locked times) are not represented here.
+
+```{r exgauss-fn}
+## Ex-Gaussian PDF (mu, sigma, tau)
+exg_pdf <- function(x, mu, sigma, tau) {
+  (1 / tau) * exp((mu - x) / tau + (sigma^2) / (2 * tau^2)) *
+    pnorm((x - mu) / sigma - sigma / tau)
+}
+
+## Method-of-moments ex-Gaussian fit (no package needed; this is what
+## retimes::mexgauss computes internally).
+mexgauss <- function(x) {
+  x <- x[!is.na(x)]
+  m <- mean(x); s <- sd(x)
+  sk <- mean((x - m)^3) / s^3                 # sample skewness
+  tau <- s * (abs(sk) / 2)^(1/3)              # tau from third moment
+  tau <- max(tau, 1e-4)                       # guard against tau = 0
+  mu  <- m - tau
+  sigma <- sqrt(max(s^2 - tau^2, 1e-6))       # guard against negative variance
+  c(mu = mu, sigma = sigma, tau = tau)
+}
+
+## Fit per subject within a group, return group-mean scaled density + SE
+exgauss_group <- function(rt_df, grid, bin_width) {
+  fits <- rt_df %>%
+    dplyr::group_by(subject) %>%
+    dplyr::filter(sum(!is.na(rt)) >= 10) %>%      # need enough trials to fit
+    dplyr::summarise(
+      par = list(tryCatch(mexgauss(rt[!is.na(rt)]),
+                          error = function(e) c(mu = NA, sigma = NA, tau = NA))),
+      n   = sum(!is.na(rt)),
+      .groups = "drop"
+    )
+
+  dens <- lapply(seq_len(nrow(fits)), function(i) {
+    p <- fits$par[[i]]
+    if (any(is.na(p))) return(NULL)
+    fits$n[i] * exg_pdf(grid, p["mu"], p["sigma"], p["tau"]) * bin_width
+  })
+  dens <- do.call(rbind, dens[!vapply(dens, is.null, logical(1))])
+
+  data.frame(
+    x    = grid,
+    mean = colMeans(dens, na.rm = TRUE),
+    se   = apply(dens, 2, sd, na.rm = TRUE) / sqrt(nrow(dens))
+  )
+}
+
+## RT data for the curve: hits + lates, target-locked. Uses trial_excl (same
+## RT-outlier session exclusion as beh_long), not the unfiltered trial.
+rt_curve <- trial_excl %>%
+  dplyr::filter(resp %in% c(1, 2), !is.na(rt), rt > 0) %>%
+  dplyr::mutate(subject = factor(subject))
+
+grid      <- seq(0, max(rt_curve$rt, na.rm = TRUE), length.out = 2000)
+bin_width <- diff(range(rt_curve$rt, na.rm = TRUE)) /
+             ceiling(sqrt(length(unique(rt_curve$subject))))
+```
+
+## By drug
+
+```{r exgauss-drug, fig.width=6, fig.height=4}
+dens_drug <- dplyr::bind_rows(lapply(levels(rt_curve$drug), function(dr) {
+  exgauss_group(dplyr::filter(rt_curve, drug == dr), grid, bin_width) %>%
+    dplyr::mutate(drug = dr)
+})) %>% dplyr::mutate(drug = factor(drug, levels = c("PBO", "MPH", "SUL")))
+
+p_exg_drug <- ggplot(dens_drug, aes(x, mean, colour = drug, fill = drug)) +
+  geom_ribbon(aes(ymin = mean - se, ymax = mean + se),
+              alpha = .25, colour = NA) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = drug_cols) +
+  scale_fill_manual(values = drug_cols) +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(x = "Response time (s)", y = "Frequency", colour = "Drug",
+       fill = "Drug") +
+  theme_classic(base_size = 14)
+
+print(p_exg_drug)
+save_fig(p_exg_drug, "xGaussian_drug", width = 6, height = 4)
+```
+
+## By reward
+
+```{r exgauss-reward, fig.width=6, fig.height=4}
+dens_rew <- dplyr::bind_rows(lapply(levels(rt_curve$reward), function(rw) {
+  exgauss_group(dplyr::filter(rt_curve, reward == rw), grid, bin_width) %>%
+    dplyr::mutate(reward = rw)
+})) %>% dplyr::mutate(reward = factor(reward, levels = c("Low", "High")))
+
+p_exg_rew <- ggplot(dens_rew, aes(x, mean, colour = reward, fill = reward)) +
+  geom_ribbon(aes(ymin = mean - se, ymax = mean + se),
+              alpha = .25, colour = NA) +
+  geom_line(linewidth = 1) +
+  scale_colour_manual(values = c(Low = "grey55", High = "#D55E00")) +
+  scale_fill_manual(values = c(Low = "grey55", High = "#D55E00")) +
+  coord_cartesian(xlim = c(0, 1)) +
+  labs(x = "Response time (s)", y = "Frequency", colour = "Reward",
+       fill = "Reward") +
+  theme_classic(base_size = 14)
+
+print(p_exg_rew)
+save_fig(p_exg_rew, "xGaussian_reward", width = 6, height = 4)
+```
+# Ex-Gaussian parameter statistics (supplementary)
+
+The ex-Gaussian decomposes the RT distribution into a Gaussian component
+(`mu`, `sigma`) and an exponential tail (`tau`). `tau` captures occasional slow
+responses (lapses), so a drug effect on `tau` specifically would indicate a
+change in lapsing rather than a uniform speed shift.
+
+Because per-cell fits (28 trials) are noisy, the Drug and Reward effects are
+estimated separately from **collapsed** fits: per subject x drug (56 trials,
+collapsed over reward) and per subject x reward (collapsed over drug). This
+gives more stable parameter estimates but does not test a Drug x Reward
+interaction; the interaction is covered by the RT and categorical analyses.
+
+```{r exgauss-stats}
+## Fit ex-Gaussian per subject within each level of a grouping factor.
+## Returns one row per subject x level with mu, sigma, tau.
+fit_params_by <- function(rt_df, grpvar) {
+  rt_df %>%
+    dplyr::group_by(subject, .data[[grpvar]]) %>%
+    dplyr::filter(sum(!is.na(rt)) >= 10) %>%      # enough trials to fit
+    dplyr::summarise(
+      par = list(tryCatch(mexgauss(rt[!is.na(rt)]),
+                          error = function(e) c(mu = NA, sigma = NA, tau = NA))),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(
+      mu    = vapply(par, function(p) p["mu"],    numeric(1)),
+      sigma = vapply(par, function(p) p["sigma"], numeric(1)),
+      tau   = vapply(par, function(p) p["tau"],   numeric(1))
+    ) %>%
+    dplyr::select(-par) %>%
+    dplyr::rename(level = !!grpvar)
+}
+
+## rt_curve (hits + lates, target-locked) is defined in the density section.
+params_drug   <- fit_params_by(rt_curve, "drug")
+params_reward <- fit_params_by(rt_curve, "reward")
+
+## ---- One-way repeated-measures tests --------------------------------------
+## Drug (3 levels): one-way rmANOVA per parameter.
+## Reward (2 levels): paired t-test per parameter.
+exg_drug_test <- function(param) {
+  d <- params_drug %>%
+    dplyr::select(subject, level, val = all_of(param)) %>%
+    tidyr::drop_na()
+  keep <- d %>% dplyr::count(subject) %>% dplyr::filter(n == 3) %>%
+    dplyr::pull(subject)
+  d <- d %>% dplyr::filter(subject %in% keep) %>% droplevels()
+
+  aov_res <- afex::aov_ez(id = "subject", dv = "val", data = d,
+                          within =  "level")  # factor is 'level'
+  at <- as.data.frame(aov_res$anova_table)
+  data.frame(
+    Parameter = param,
+    Effect    = "Drug",
+    Statistic = sprintf("%.2f (%.0f, %.0f)",
+                        at[["F"]], at[["num Df"]], at[["den Df"]]),
+    p   = ifelse(at[["Pr(>F)"]] < .001, "< .001",
+                 sprintf("%.3f", at[["Pr(>F)"]])),
+    ES  = sprintf("%.3f", at[["pes"]]),
+    res = I(list(aov_res)),
+    row.names = NULL, check.names = FALSE
+  )
+}
+
+exg_reward_test <- function(param) {
+  w <- params_reward %>%
+    dplyr::select(subject, level, val = all_of(param)) %>%
+    tidyr::drop_na() %>%
+    tidyr::pivot_wider(names_from = level, values_from = val) %>%
+    tidyr::drop_na()
+  tt <- t.test(w$Low, w$High, paired = TRUE)
+  d  <- unname(tt$statistic) / sqrt(nrow(w))      # Cohen's d, paired
+  data.frame(
+    Parameter = param,
+    Effect    = "Reward",
+    Statistic = sprintf("t(%.0f) = %.2f", tt$parameter, tt$statistic),
+    p   = ifelse(tt$p.value < .001, "< .001", sprintf("%.3f", tt$p.value)),
+    ES  = sprintf("%.2f", d),
+    res = I(list(tt)),
+    row.names = NULL, check.names = FALSE
+  )
+}
+
+params <- c("mu", "sigma", "tau")
+exg_results <- dplyr::bind_rows(
+  lapply(params, exg_drug_test),
+  lapply(params, exg_reward_test)
+)
+
+## drop the stored-object column for display, keep ordering Parameter then Effect
+exg_tbl <- exg_results %>%
+  dplyr::select(-res) %>%
+  dplyr::arrange(factor(Parameter, levels = params), Effect)
+print(exg_tbl)
+```
+
+```{r exgauss-supp-table}
+## Supplementary table: one row-wise section per parameter.
+exg_disp <- exg_tbl %>% dplyr::select(-Parameter)
+
+n_per <- exg_tbl %>% dplyr::count(Parameter) %>%
+  dplyr::arrange(factor(Parameter, levels = params)) %>% dplyr::pull(n)
+
+param_labels <- c(mu = "mu (Gaussian mean)", sigma = "sigma (Gaussian SD)",
+                  tau = "tau (exponential tail)")
+
+supp_table <- exg_disp %>%
+  kable("html", escape = FALSE, row.names = FALSE,
+        caption = 'Supplementary Table S1. Ex-Gaussian RT parameters: effects of Drug and Reward',
+        col.names = c("Effect", "Statistic", "<i>P</i>", "Effect size")) %>%
+  kable_classic(full_width = FALSE, html_font = "Cambria",
+                font_size = 16, position = 'center')
+
+start <- 0
+for (i in seq_along(params)) {
+  supp_table <- supp_table %>%
+    pack_rows(param_labels[params[i]], start + 1, start + n_per[i],
+              label_row_css = "font-style: italic;")
+  start <- start + n_per[i]
+}
+
+supp_table <- supp_table %>%
+  footnote(general = paste(
+    "Ex-Gaussian fit by method of moments. Drug effect: one-way",
+    "repeated-measures ANOVA (Statistic = F, Effect size = partial eta-squared),",
+    "Reward effect: paired t-test",
+    "(Statistic = t, Effect size = Cohen's d)."),
+    general_title = "Note. ", footnote_as_chunk = TRUE)
+
+supp_table
+
+readr::write_csv(exg_tbl, file.path(outDir, "MID_exgaussian_stats.csv"))
+kableExtra::save_kable(supp_table,
+  file = file.path(outDir, "MID_exgaussian_table.png"), zoom = 2)
+kableExtra::save_kable(supp_table,
+  file = file.path(outDir, "MID_exgaussian_table.pdf"))
+```
+
+# Behavioural drug-effect covariates (for MRI group-level models)
+
+Per-subject MPH-PBO / MPH-SUL / SUL-PBO differences in RT, hit rate,
+too-late rate, too-early rate (from `beh_long`) and ex-Gaussian tau (from
+`params_drug`), with the same session exclusions as above. Used as
+between-subject covariates in the fMRI group models
+(`03_group_level/run_groupLevel_vici_MID.m`, `todo.covariate.beh*`) and in
+the brain-behaviour scatter plots (`07_brain_behaviour`).
+
+```{r beh-covariates}
+## ---- RT / hit / late / early: drug-level means, collapsed over reward ----
+beh_drug_lvl <- beh_long %>%
+  dplyr::group_by(subject, drug) %>%
+  dplyr::summarise(rt = mean(rt, na.rm = TRUE), hit = mean(hit, na.rm = TRUE),
+                   late = mean(late, na.rm = TRUE), early = mean(early, na.rm = TRUE),
+                   .groups = "drop") %>%
+  dplyr::mutate(subject = as.character(subject))
+
+beh_drug_wide <- beh_drug_lvl %>%
+  tidyr::pivot_wider(names_from = drug, values_from = c(rt, hit, late, early),
+                     names_glue = "{.value}{drug}")
+
+## ---- Ex-Gaussian tau: per-subject x drug, same exclusion as above --------
+tau_wide <- params_drug %>%
+  dplyr::mutate(subject = as.character(subject)) %>%
+  dplyr::select(subject, level, tau) %>%
+  tidyr::pivot_wider(names_from = level, values_from = tau, names_prefix = "tau")
+
+## ---- Deltas ----------------------------------------------------------------
+beh_covariates <- beh_drug_wide %>%
+  dplyr::full_join(tau_wide, by = "subject") %>%
+  dplyr::transmute(
+    subject,
+    MPH_PBO_rt    = rtMPH    - rtPBO,    MPH_SUL_rt    = rtMPH    - rtSUL,    SUL_PBO_rt    = rtSUL    - rtPBO,
+    MPH_PBO_hit   = hitMPH   - hitPBO,   MPH_SUL_hit   = hitMPH   - hitSUL,   SUL_PBO_hit   = hitSUL   - hitPBO,
+    MPH_PBO_late  = lateMPH  - latePBO,  MPH_SUL_late  = lateMPH  - lateSUL,  SUL_PBO_late  = lateSUL  - latePBO,
+    MPH_PBO_early = earlyMPH - earlyPBO, MPH_SUL_early = earlyMPH - earlySUL, SUL_PBO_early = earlySUL - earlyPBO,
+    MPH_PBO_tau   = tauMPH   - tauPBO,   MPH_SUL_tau   = tauMPH   - tauSUL,   SUL_PBO_tau   = tauSUL   - tauPBO
+  )
+
+readr::write_csv(beh_covariates, file.path(outDir, "MID_beh_covariates.csv"))
+head(beh_covariates)
+```
+
+
+# Premature (too-early) response-time profile
+
+The ex-Gaussian is defined for positive RTs only, so the curves above
+cannot show too-early (pre-target, negative) responses. These are shown
+separately here, with the same per-subject-then-average, frequency-scaled
+approach (Miller, 1988), but with a nonparametric density per subject
+(`stats::density()`). They get their own axis because they are far fewer
+than hits and lates, and their shape would be invisible on a shared one.
+
+```{r profile-fn}
+## Target-locked response time for ALL responded trials.
+## rt is given for hits/lates; for early responses the target-locked time
+## is rtCue minus the cue-period duration (raw X15). For hits/lates, where
+## both are known, rt equals rtCue - cue_dur.
+profile <- raw %>%
+  dplyr::transmute(
+    subject = X1,
+    drug    = factor(X4, levels = c(0,1,2), labels = c("PBO","MPH","SUL")),
+    reward  = factor(X12, levels = c(1,2), labels = c("Low","High")),
+    resp    = X10,
+    rt      = X11,
+    rtCue   = X13,
+    cue_dur = X15           # cue-period duration (target onset rel. to cue)
+  ) %>%
+  dplyr::filter(!is.na(reward), resp %in% c(1, 2, -1)) %>%
+  dplyr::mutate(
+    ## hits & lates: rt is already target-locked.
+    ## early responses: target-locked time = rtCue - cue_dur (negative).
+    rt_target = ifelse(resp == -1, rtCue - cue_dur, rt)
+  ) %>%
+  dplyr::filter(!is.na(rt_target)) %>%
+  drop_flagged_cells()   # same RT-outlier session exclusion as beh_long/rt_curve
+
+## Per-subject nonparametric density, scaled to frequency and averaged
+## (as exgauss_group(), but able to represent negative times). value_col
+## selects target-locked (rt_target) or cue-locked (rtCue) times.
+full_profile_group <- function(df, grid, bin_width, value_col = "rt_target") {
+  fits <- df %>%
+    dplyr::mutate(.val = .data[[value_col]]) %>%
+    dplyr::group_by(subject) %>%
+    dplyr::filter(sum(!is.na(.val)) >= 10) %>%      # need enough trials to fit
+    dplyr::summarise(
+      dens = list(tryCatch(
+        stats::density(.val, from = min(grid), to = max(grid), n = length(grid)),
+        error = function(e) NULL)),
+      n = sum(!is.na(.val)),
+      .groups = "drop"
+    )
+
+  dens_mat <- lapply(seq_len(nrow(fits)), function(i) {
+    d <- fits$dens[[i]]
+    if (is.null(d)) return(NULL)
+    fits$n[i] * d$y * bin_width
+  })
+  dens_mat <- do.call(rbind, dens_mat[!vapply(dens_mat, is.null, logical(1))])
+
+  data.frame(
+    x    = grid,
+    mean = colMeans(dens_mat, na.rm = TRUE),
+    se   = apply(dens_mat, 2, sd, na.rm = TRUE) / sqrt(nrow(dens_mat))
+  )
+}
+
+## Premature (resp == -1) trials only. rt_target can be as early as
+## -cue_dur (the cue period is 3-6 s), hence the -6 to 0 s window.
+premature <- profile %>% dplyr::filter(resp == -1)
+
+grid_premature      <- seq(-6, 0, length.out = 2000)
+bin_width_premature <- diff(range(premature$rt_target, na.rm = TRUE)) /
+                        ceiling(sqrt(length(unique(premature$subject))))
+
+## Raw cue-locked time (rtCue), NOT adjusted for cue_dur: a diagnostic
+## companion to the rt_target plots. rtCue >= 0 for every response type.
+grid_rtCue      <- seq(0, 8, length.out = 2000)
+bin_width_rtCue <- diff(range(profile$rtCue, na.rm = TRUE)) /
+                   ceiling(sqrt(length(unique(profile$subject))))
+```
+
+```{r profile-drug, fig.width=6, fig.height=4}
+dens_premature_drug <- dplyr::bind_rows(lapply(levels(premature$drug), function(dr) {
+  full_profile_group(dplyr::filter(premature, drug == dr), grid_premature, bin_width_premature) %>%
+    dplyr::mutate(drug = dr)
+})) %>% dplyr::mutate(drug = factor(drug, levels = c("PBO", "MPH", "SUL")))
+
+p_profile_drug <- ggplot(dens_premature_drug, aes(x, mean, colour = drug, fill = drug)) +
+  geom_ribbon(aes(ymin = pmax(mean - se, 0), ymax = mean + se), alpha = .2, colour = NA) +
+  ## semi-transparent lines, so overlapping curves stay visible
+  geom_line(linewidth = 0.8, alpha = .7) +
+  scale_colour_manual(values = drug_cols) +
+  scale_fill_manual(values = drug_cols) +
+  coord_cartesian(xlim = c(-6, 0)) +
+  labs(x = "Response time relative to target onset (s)",
+       y = "Frequency", colour = "Drug", fill = "Drug",
+       subtitle = "Premature (too-early) responses only") +
+  theme_classic(base_size = 14)
+
+save_fig(p_profile_drug, "premature_rt_drug", width = 6, height = 4)
+p_profile_drug
+```
+
+```{r profile-reward, fig.width=6, fig.height=4}
+dens_premature_reward <- dplyr::bind_rows(lapply(levels(premature$reward), function(rw) {
+  full_profile_group(dplyr::filter(premature, reward == rw), grid_premature, bin_width_premature) %>%
+    dplyr::mutate(reward = rw)
+})) %>% dplyr::mutate(reward = factor(reward, levels = c("Low", "High")))
+
+p_profile_reward <- ggplot(dens_premature_reward, aes(x, mean, colour = reward, fill = reward)) +
+  geom_ribbon(aes(ymin = pmax(mean - se, 0), ymax = mean + se), alpha = .2, colour = NA) +
+  geom_line(linewidth = 0.8, alpha = .7) +
+  scale_colour_manual(values = c(Low = "grey55", High = "#D55E00")) +
+  scale_fill_manual(values = c(Low = "grey55", High = "#D55E00")) +
+  coord_cartesian(xlim = c(-6, 0)) +
+  labs(x = "Response time relative to target onset (s)",
+       y = "Frequency", colour = "Reward", fill = "Reward",
+       subtitle = "Premature (too-early) responses only") +
+  theme_classic(base_size = 14)
+
+save_fig(p_profile_reward, "premature_rt_reward", width = 6, height = 4)
+p_profile_reward
+```
+
+## Raw cue-locked time (diagnostic, not target-locked)
+
+`rtCue` without the `cue_dur` adjustment. Because the cue period is
+jittered (3-6 s), a hit/late response's `rtCue` is `cue_dur + rt`, so the
+hit/late peak is smeared here compared with the target-locked plots. A
+sanity check on those plots, not a replacement (not evaluated by default).
+
+```{r profile-rtcue-drug, eval=FALSE, fig.height=4, fig.width=6, include=FALSE}
+dens_rtCue_drug <- dplyr::bind_rows(lapply(levels(profile$drug), function(dr) {
+  full_profile_group(dplyr::filter(profile, drug == dr), grid_rtCue, bin_width_rtCue,
+                     value_col = "rtCue") %>%
+    dplyr::mutate(drug = dr)
+})) %>% dplyr::mutate(drug = factor(drug, levels = c("PBO", "MPH", "SUL")))
+
+p_rtcue_drug <- ggplot(dens_rtCue_drug, aes(x, mean, colour = drug, fill = drug)) +
+  geom_ribbon(aes(ymin = mean - se, ymax = mean + se), alpha = .2, colour = NA) +
+  geom_line(linewidth = 0.8, alpha = .7) +
+  scale_colour_manual(values = drug_cols) +
+  scale_fill_manual(values = drug_cols) +
+  coord_cartesian(xlim = c(0, 8)) +
+  labs(x = "Response time relative to cue onset (s), uncorrected for cue duration",
+       y = "Frequency", colour = "Drug", fill = "Drug") +
+  theme_classic(base_size = 14)
+
+save_fig(p_rtcue_drug, "rtCue_raw_drug", width = 6, height = 4)
+p_rtcue_drug
+```
+
+```{r profile-rtcue-reward, eval=FALSE, fig.height=4, fig.width=6, include=FALSE}
+dens_rtCue_reward <- dplyr::bind_rows(lapply(levels(profile$reward), function(rw) {
+  full_profile_group(dplyr::filter(profile, reward == rw), grid_rtCue, bin_width_rtCue,
+                     value_col = "rtCue") %>%
+    dplyr::mutate(reward = rw)
+})) %>% dplyr::mutate(reward = factor(reward, levels = c("Low", "High")))
+
+p_rtcue_reward <- ggplot(dens_rtCue_reward, aes(x, mean, colour = reward, fill = reward)) +
+  geom_ribbon(aes(ymin = mean - se, ymax = mean + se), alpha = .2, colour = NA) +
+  geom_line(linewidth = 0.8, alpha = .7) +
+  scale_colour_manual(values = c(Low = "grey55", High = "#D55E00")) +
+  scale_fill_manual(values = c(Low = "grey55", High = "#D55E00")) +
+  coord_cartesian(xlim = c(0, 8)) +
+  labs(x = "Response time relative to cue onset (s), uncorrected for cue duration",
+       y = "Frequency", colour = "Reward", fill = "Reward") +
+  theme_classic(base_size = 14)
+
+save_fig(p_rtcue_reward, "rtCue_raw_reward", width = 6, height = 4)
+p_rtcue_reward
+```
+
+# Neural cluster tables (whole-brain TFCE)
+
+Publication tables of the whole-brain TFCE-corrected clusters, built from
+`all_clusters_<hrf_type>.csv` and `all_regions_<hrf_type>.csv`
+(`05_cluster_tables/combine_cluster_tables.m`). Run this section after the
+fMRI pipeline; the rest of the document does not depend on it.
+
+- **Task activation** (session average): reported per anatomical region
+  rather than as a peak list, because TFCE yields very large clusters that
+  a few peak coordinates describe poorly.
+- **Drug effects** (MPH vs PBO / MPH vs SUL / SUL vs PBO).
+- **Behavioural covariate effects** (individual behavioural drug effect as
+  a covariate on the matching drug comparison).
+
+```{r neural-cluster-load}
+neural_hrf_type <- "canonical_hrf"   # must match what combine_cluster_tables.m was run with
+
+neural_clusters_file <- file.path(projectDir, "bids", "derivatives", "mri",
+                                  "groupLevel", "MID", "regular", neural_hrf_type,
+                                  sprintf("all_clusters_%s.csv", neural_hrf_type))
+
+clusters_raw <- readr::read_csv(neural_clusters_file, show_col_types = FALSE) %>%
+  ## readr reads empty fields as NA; the no-covariate rows need ""
+  dplyr::mutate(Covariate = tidyr::replace_na(Covariate, ""))
+
+## Per-region breakdown of the same clusters: one row per cluster x region
+neural_regions_file <- file.path(projectDir, "bids", "derivatives", "mri",
+                                 "groupLevel", "MID", "regular", neural_hrf_type,
+                                 sprintf("all_regions_%s.csv", neural_hrf_type))
+
+regions_raw <- readr::read_csv(neural_regions_file, show_col_types = FALSE) %>%
+  dplyr::mutate(Covariate = tidyr::replace_na(Covariate, ""))
+```
+
+```{r neural-cluster-labels}
+## Analyses to report. Like contrast_labels below, this also filters: rows
+## not listed (e.g. the single-drug models "MPH"/"PBO"/"SUL") are dropped.
+drug_labels <- c(
+  sessionAverage = "Session average",
+  MPHvsPBO       = "MPH vs PBO",
+  MPHvsSUL       = "MPH vs SUL",
+  SULvsPBO       = "SUL vs PBO"
+)
+
+## Task contrasts to report, in table order; contrasts not listed are
+## dropped from every table.
+contrast_labels <- c(
+  Cue       = "Anticipation (across reward)",
+  HCvsLC    = "High vs low reward cue",
+  HitvsMiss = "Hit vs miss",
+  Target    = "Target"
+)
+
+## Covariate stem -> readable label, e.g. "ki_wholeStriatum" -> "Ki (whole striatum)"
+covariate_label <- function(covariate) {
+  map <- c(ki_VS_new = "Ventral striatum ki", ki_wholeStriatum = "Whole striatum ki",
+           ki_wholeCaudate = "Caudate ki", ki_wholePutamen = "Putamen ki",
+           ## behavioural drug-effect covariates
+           mphBehEffect_hit    = "MPH hit-rate benefit",
+           mphBehEffect_early  = "MPH premature-response change",
+           mphBehEffect_late   = "MPH late-response change",
+           mphBehEffect_rt     = "MPH reaction-time change",
+           tauEffect_MPHvsPBO  = "MPH tau change",
+           hitEffect_MPHvsSUL  = "MPH-vs-SUL hit-rate difference",
+           lateEffect_MPHvsSUL = "MPH-vs-SUL late-response difference",
+           rtEffect_MPHvsSUL   = "MPH-vs-SUL reaction-time difference",
+           TauEffect_MPHvsSUL  = "MPH-vs-SUL tau difference",
+           SULvsPBO_late       = "SUL late-response change")
+  out <- ifelse(covariate == "", "", unname(map[covariate]))
+  ifelse(is.na(out) & covariate != "", covariate, out)   # fall back to the raw stem if unmapped
+}
+
+hemi_labels <- c(L = "Left", R = "Right", M = "Midline")
+
+## Optional renaming of atlas regions in the tables (name = label as in the
+## CSV, value = printed label). Example:
+##   region_rename <- c("POrG posterior orbital gyrus"  = "OFC",
+##                      "ACgG anterior cingulate gyrus" = "ACC",
+##                      "PCgG posterior cingulate gyrus" = "PCC")
+region_rename <- character(0)
+apply_region_rename <- function(region) {
+  if (length(region_rename) == 0) return(region)
+  hit <- region %in% names(region_rename)
+  region[hit] <- unname(region_rename[region[hit]])
+  region
+}
+
+clusters_tbl <- clusters_raw %>%
+  dplyr::filter(TaskContrast %in% names(contrast_labels),
+                DrugComparison %in% names(drug_labels)) %>%
+  dplyr::mutate(
+    Region = apply_region_rename(Region),
+    DrugLabel = dplyr::coalesce(unname(drug_labels[DrugComparison]), DrugComparison),
+    CovLabel  = covariate_label(Covariate),
+    Model     = ifelse(CovLabel == "", DrugLabel, paste0(DrugLabel, " × ", CovLabel)),
+    Contrast_label = dplyr::coalesce(unname(contrast_labels[TaskContrast]), TaskContrast),
+    Direction_label = ifelse(Direction == "positive", "Positive", "Negative"),
+    Hemisphere_label = dplyr::coalesce(unname(hemi_labels[Hemisphere]), Hemisphere),
+    Coordinates = sprintf("%d, %d, %d", round(x), round(y), round(z)),
+    Peak_t_fmt  = sprintf("%.2f", Peak_t),
+    p_fmt       = ifelse(pFWE < .001, "< .001", sprintf("%.3f", pFWE))
+  )
+
+## Same labelling for the region breakdown, plus its own display columns.
+regions_tbl <- regions_raw %>%
+  dplyr::filter(TaskContrast %in% names(contrast_labels),
+                DrugComparison %in% names(drug_labels)) %>%
+  dplyr::mutate(
+    Region = apply_region_rename(Region),
+    DrugLabel = dplyr::coalesce(unname(drug_labels[DrugComparison]), DrugComparison),
+    CovLabel  = covariate_label(Covariate),
+    Model     = ifelse(CovLabel == "", DrugLabel, paste0(DrugLabel, " × ", CovLabel)),
+    Contrast_label   = dplyr::coalesce(unname(contrast_labels[TaskContrast]), TaskContrast),
+    Direction_label  = factor(ifelse(Direction == "positive", "Positive", "Negative"),
+                              levels = c("Positive", "Negative")),
+    Hemisphere_label = dplyr::coalesce(unname(hemi_labels[Hemisphere]), Hemisphere),
+    Coordinates   = sprintf("%d, %d, %d", round(x), round(y), round(z)),
+    Peak_t_fmt    = sprintf("%.2f", Peak_t),
+    p_fmt         = ifelse(pFWE < .001, "< .001", sprintf("%.3f", pFWE)),
+    Cluster_label = sprintf("%d (k = %s)", Cluster,
+                            format(Size_k, big.mark = ",", trim = TRUE)),
+    Region_k_fmt   = format(Region_k, big.mark = ",", trim = TRUE),
+    Region_pct_fmt = sprintf("%.1f", Region_pct)
+  )
+
+## White matter and ventricles make up a large share of the big clusters
+## without being anatomically informative; they are left out of the region
+## tables (noted in the footnote). character(0) keeps them.
+region_exclude <- c("Cerebral White Matter", "Lateral Ventricle")
+
+## Fixed order for the non-covariate models, covariate combinations appended
+## afterwards in whatever order they first appear.
+model_levels <- c(unname(drug_labels))
+extra_levels <- setdiff(unique(clusters_tbl$Model), model_levels)
+model_levels <- c(model_levels[model_levels %in% clusters_tbl$Model], extra_levels)
+
+clusters_tbl <- clusters_tbl %>%
+  dplyr::mutate(Model = factor(Model, levels = model_levels)) %>%
+  dplyr::arrange(Model, factor(Contrast_label, levels = unname(contrast_labels)),
+                 dplyr::desc(Size_k))
+```
+
+```{r neural-cluster-table-fn}
+## Builds, prints, and saves (csv/png/pdf) one cluster table from a subset of
+## clusters_tbl, grouped/packed by whichever column name is passed as
+## group_var ("Model" or "Contrast_label"). group_levels fixes the row-group
+## order; must cover every value of group_var actually present in `data`.
+if (!requireNamespace("webshot2", quietly = TRUE)) install.packages("webshot2")
+
+## bonferroni_n: when given, adds a column of pFWE multiplied by that number,
+## capped at 1. TFCE controls the family-wise error rate WITHIN one map but
+## not across the number of maps tested, so the covariate tables carry this
+## second correction; leave NULL for the pre-planned contrasts, which are not
+## corrected across the cells of the design.
+build_cluster_table <- function(data, group_var, group_levels, caption, basename,
+                                bonferroni_n = NULL) {
+  disp <- data %>%
+    dplyr::mutate(GroupVar = factor(.data[[group_var]], levels = group_levels)) %>%
+    dplyr::arrange(GroupVar, factor(Contrast_label, levels = unname(contrast_labels)),
+                   dplyr::desc(Size_k)) %>%
+    {if (is.null(bonferroni_n)) . else dplyr::mutate(., p_bonf_fmt = {
+       pb <- pmin(1, pFWE * bonferroni_n)
+       ifelse(pb < .001, "&lt; .001", sprintf("%.3f", pb))
+     })} %>%
+    dplyr::select(GroupVar, Contrast_label, Direction_label, Region, Hemisphere_label,
+                  Coordinates, Peak_t_fmt, Size_k, p_fmt,
+                  dplyr::any_of("p_bonf_fmt"))
+
+  group_counts <- disp %>% dplyr::count(GroupVar) %>% dplyr::arrange(GroupVar)
+
+  tbl <- disp %>%
+    dplyr::select(-GroupVar) %>%
+    kable("html", escape = FALSE, row.names = FALSE, caption = caption,
+          col.names = c("Contrast", "Direction", "Region", "Hemisphere",
+                        "MNI (x, y, z)", "Peak t", "k", "<i>P</i>FWE",
+                        if (is.null(bonferroni_n)) NULL else "<i>P</i>Bonf")) %>%
+    kable_classic(full_width = FALSE, html_font = "Cambria",
+                  font_size = 14, position = "center") %>%
+    ## Keep coordinates and contrast labels on one line
+    kableExtra::column_spec(1, extra_css = "white-space: nowrap;",
+                            include_thead = TRUE) %>%
+    kableExtra::column_spec(5, extra_css = "white-space: nowrap;",
+                            include_thead = TRUE)
+
+  start <- 0
+  for (i in seq_along(group_counts$GroupVar)) {
+    tbl <- tbl %>%
+      pack_rows(as.character(group_counts$GroupVar[i]), start + 1,
+                start + group_counts$n[i],
+                label_row_css = "font-style: italic; background-color: #f2f2f2;")
+    start <- start + group_counts$n[i]
+  }
+
+  tbl <- tbl %>%
+    footnote(general = paste(
+      "All clusters survive threshold-free cluster enhancement (TFCE),",
+      "family-wise-error corrected at p < .05. Direction is 'Positive' for",
+      "the first-named condition/drug (or higher covariate values) showing",
+      "greater activation, 'Negative' for the reverse -- see Methods for the",
+      "exact contrast definitions. k = cluster size in voxels.",
+      if (is.null(bonferroni_n)) "" else paste(
+        "<i>P</i>Bonf is <i>P</i>FWE multiplied by", bonferroni_n,
+        "and capped at 1, correcting for the number of covariate maps tested",
+        "in addition to the within-map TFCE correction.")),
+      general_title = "Note. ", footnote_as_chunk = TRUE, escape = FALSE)
+
+  readr::write_csv(data, file.path(outDir, paste0(basename, ".csv")))
+  kableExtra::save_kable(tbl, file = file.path(outDir, paste0(basename, ".png")), zoom = 2)
+  kableExtra::save_kable(tbl, file = file.path(outDir, paste0(basename, ".pdf")))
+
+  tbl
+}
+
+## Same for the per-region breakdown (different columns: regions, not peaks)
+build_region_table <- function(data, group_levels, caption, basename) {
+  disp_data <- data %>%
+    dplyr::filter(!Region %in% region_exclude) %>%
+    dplyr::mutate(GroupVar = factor(Contrast_label, levels = group_levels)) %>%
+    dplyr::arrange(GroupVar, Direction_label, dplyr::desc(Size_k),
+                   dplyr::desc(Region_k))
+
+  disp <- disp_data %>%
+    dplyr::select(GroupVar, Direction_label, Cluster_label, Region, Hemisphere_label,
+                  Region_k_fmt, Region_pct_fmt, Coordinates, Peak_t_fmt, p_fmt)
+
+  group_counts <- disp %>% dplyr::count(GroupVar) %>% dplyr::arrange(GroupVar)
+
+  tbl <- disp %>%
+    dplyr::select(-GroupVar) %>%
+    kable("html", escape = FALSE, row.names = FALSE, caption = caption,
+          col.names = c("Direction", "Cluster", "Region", "Hemisphere",
+                        "Voxels", "% of cluster", "MNI (x, y, z)", "Peak t",
+                        "<i>P</i>FWE")) %>%
+    kable_classic(full_width = FALSE, html_font = "Cambria",
+                  font_size = 14, position = "center") %>%
+    ## Keep coordinates on one line
+    kableExtra::column_spec(7, extra_css = "white-space: nowrap;",
+                            include_thead = TRUE)
+
+  start <- 0
+  for (i in seq_along(group_counts$GroupVar)) {
+    tbl <- tbl %>%
+      pack_rows(as.character(group_counts$GroupVar[i]), start + 1,
+                start + group_counts$n[i],
+                label_row_css = "font-style: italic; background-color: #f2f2f2;")
+    start <- start + group_counts$n[i]
+  }
+
+  tbl <- tbl %>%
+    footnote(general = paste(
+      "All clusters survive threshold-free cluster enhancement (TFCE),",
+      "family-wise-error corrected at p < .05. Each row is one anatomical",
+      "region (Neuromorphometrics atlas) within one cluster: Voxels is the",
+      "number of that cluster's significant voxels falling in the region,",
+      "'% of cluster' their share of it, and the coordinates and peak t are",
+      "the strongest voxel within that region. Clusters are listed as",
+      "'cluster number (k = total voxels)'. Because TFCE returns very large",
+      "contiguous clusters, spatial specificity is limited and a cluster",
+      "should not be read as evidence for any single region within it",
+      "(Woo et al., 2014). White-matter and ventricle labels are omitted.",
+      "Direction is 'Positive' for the first-named condition showing greater",
+      "activation, 'Negative' for the reverse."),
+      general_title = "Note. ", footnote_as_chunk = TRUE)
+
+  readr::write_csv(disp_data, file.path(outDir, paste0(basename, ".csv")))
+  kableExtra::save_kable(tbl, file = file.path(outDir, paste0(basename, ".png")), zoom = 2)
+  kableExtra::save_kable(tbl, file = file.path(outDir, paste0(basename, ".pdf")))
+
+  tbl
+}
+```
+
+## Task activation (supplementary)
+
+```{r neural-cluster-task}
+avg_task_regions <- regions_tbl %>%
+  dplyr::filter(Covariate == "", DrugComparison == "sessionAverage")
+
+build_region_table(
+  avg_task_regions, unname(contrast_labels),
+  paste("Supplementary Table S3. Whole-brain TFCE-corrected clusters:",
+        "task activation (session average), broken down by",
+        "anatomical region"),
+  "MID_neural_clusters_task_activation"
+)
+```
+
+## Drug effects (main text)
+
+```{r neural-cluster-drug}
+drug_tbl <- clusters_tbl %>%
+  dplyr::filter(Covariate == "", DrugComparison != "sessionAverage")
+
+build_cluster_table(
+  drug_tbl, "Model", model_levels[model_levels %in% unique(drug_tbl$Model)],
+  paste("Table 2. Whole-brain TFCE-corrected clusters: drug effects on",
+        "task-related activation"),
+  "MID_neural_clusters_drug_effects"
+)
+```
+
+## ki covariate effects
+
+Not tabled here; the ki covariate results are reported in the text. A
+table can be built the same way, filtering on
+`startsWith(Covariate, "ki_")`.
+
+## Behavioural covariate effects (supplementary)
+
+```{r neural-cluster-behcov}
+behcov_tbl <- clusters_tbl %>%
+  dplyr::filter(Covariate != "", !startsWith(as.character(Covariate), "ki_"))
+
+if (nrow(behcov_tbl) == 0) {
+  message("No behavioural covariate clusters to table.")
+} else {
+  build_cluster_table(
+    behcov_tbl, "Model",
+    model_levels[model_levels %in% unique(behcov_tbl$Model)],
+    paste("Supplementary Table S4. Whole-brain TFCE-corrected clusters:",
+          "individual differences in the behavioural drug effect as a",
+          "covariate on the corresponding drug comparison"),
+    "MID_neural_clusters_beh_covariates",
+    bonferroni_n = 88   # number of behavioural-covariate maps tested
+  )
+}
+```
+
+# Session info
+
+```{r session}
+sessionInfo()
+```

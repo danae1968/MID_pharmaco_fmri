@@ -1,0 +1,26 @@
+# Never commit data or results
+*.nii
+*.nii.gz
+*.mat
+*.csv
+*.tsv
+*.log
+*.png
+*.pdf
+
+# MATLAB
+*.asv
+*.m~
+
+# R / RStudio
+.Rhistory
+.RData
+.Rproj.user/
+*.html
+*_cache/
+*_files/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
