@@ -59,7 +59,7 @@ environment variable.
 
 ## Author and credits
 
-Danae Papadopetraki.
+Danae Papadopetraki, README by Claude
 
 The first- and group-level scripts started from a lab template by Ruben
 van den Bosch, and `estimate_tfce_mid.m` is adapted from his TFCE
